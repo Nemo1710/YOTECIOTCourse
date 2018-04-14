@@ -1,0 +1,18 @@
+void fococallback(char *x, uint16_t len) {
+  Serial.println(x);
+  
+  String mijin=String(x);
+  if(mijin=="ON"){
+    digitalWrite(D0,HIGH);
+    focoestado.publish("ON");
+    fococ=true;
+    Serial.println("pucho"); 
+    
+  }else if(mijin=="OFF"){
+    fococ=false;
+    digitalWrite(D0,LOW);
+    Serial.println("michaela");
+    focoestado.publish("OFF");
+  }
+  
+}
