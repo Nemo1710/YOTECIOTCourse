@@ -1,0 +1,379 @@
+#!/bin/sh
+# iptables, by Technion
+# $Id: iptables,v 1.45 2008/09/23 23:22:16 eperez Exp $
+# chkconfig: 2345 12 80
+# description: Script for setting IPTABLES rules
+# processname: iptables
+# Traduccion al espanol:
+# Ing. Ernesto Perez Estevez
+# http://www.ernestoperez.com/
+
+
+#  Si se ejecuta en Redhat, poner en YES, sino, en NO
+REDHAT="YES"
+
+# Informacion de Red, necesita ser ajustada por usted.
+INTERNALIF="eth1"
+INTERNALNET="192.168.0.0/24"
+INTERNALBCAST="192.168.0.255"
+EXTERNALIF="eth0"
+
+# Caminos - No tocar si no se conoce.
+DMESG="/bin/dmesg"
+IPTABLES="`which iptables`"
+MODPROBE="/sbin/modprobe"
+
+
+# Esta parte permite al usuario de redhat llamar al script con 
+# los parametros: start/stop/restart
+if [ X"$REDHAT" = X"YES" ]; then
+	. /etc/rc.d/init.d/functions
+	case "$1" in
+		stop)
+			action "Shutting down firewall:" echo
+			$IPTABLES -F
+			$IPTABLES -P FORWARD DROP
+			exit 0
+			;;
+		status)
+			echo "The status command is not supported for iptables"
+			exit 0
+			;;
+		restart|reload)
+			$0 stop
+			exec $0 start
+			;;
+		start)
+			action "Starting Firewall:" echo
+                        ;;
+                *)
+                        echo "Usage: firewall (start|stop|restart)"
+                        exit 1
+        esac
+fi
+
+
+################################################################
+#Insertando los modulos. Debe hacerse automaticamente si se requiere
+dmesg -n 1 #No saca la bandera de copyright
+/sbin/modprobe ip_tables
+/sbin/modprobe iptable_filter
+/sbin/modprobe ip_conntrack
+/sbin/modprobe ip_conntrack_ftp
+$MODPROBE ip_queue
+
+#
+## Vaciar las reglas que puedan existir
+#
+# Paquetes provenientes del exterior
+$IPTABLES -F INPUT
+# Paquetes de la red interna hacia el exterior
+$IPTABLES -F OUTPUT
+# Forwarding/enmascaramiento
+$IPTABLES -F FORWARD
+#Tabla de NAT
+$IPTABLES -t nat -F
+
+#
+#Deshabilitando ataques spoofing
+#Comente esta linea si se usa IPSEC
+echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
+
+#No responder a pings de broadcast
+echo "1" > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts
+
+#No responder a los pings - Activar si se requiere
+#echo "1" > /proc/sys/net/ipv4/icmp_echo_ignore_all
+
+#Habilitando el forwarding
+echo 1 >/proc/sys/net/ipv4/ip_forward
+
+#Normalmente usted no tiene control de la ruta que un paquete sigue. 
+#IP Source Routing (SRR) es una forma de especificarle a un paquete la ruta 
+#exacta que un paqeute debe seguir. Habilitarlo es una mala idea, en forma 
+#general. Se desactiva as�:
+echo 0 >/proc/sys/net/ipv4/conf/all/accept_source_route
+
+#Anular los TimeStamps. Se puede averiguar el uptime de un sistema
+echo 0 > /proc/sys/net/ipv4/tcp_timestamps
+
+#Habilitar SYN Cookies, previene algunos DoS
+echo 1 > /proc/sys/net/ipv4/tcp_syncookies
+
+#Dehabilitar redirects. Habilitar si no se actua como router
+echo 0 >/proc/sys/net/ipv4/conf/all/accept_redirects
+
+#Habilitar proteccion contra mensaje invalido
+#Algunos routers envian mensajes invalidos que son guardados en 
+#log logs por el kernel. Este punto le indica al kernel no guardar
+#estos datos y se protege contra un posible ataque de negacion
+#debido a tener el filesystem lleno
+echo 1 > /proc/sys/net/ipv4/icmp_ignore_bogus_error_responses
+
+#Permitir direcciones dinamicas, Bueno para clientes dialup y xDSL cuyas IPs
+#pueden variar. No es necesario para clientes dedicados
+#echo "1" > /proc/sys/net/ipv4/ip_dynaddr
+
+#Guardar a los marcianos. Paquetes que llegan en una interfaz no esperada
+#Algunas tarjetas de red se niegan a trabajar. Comentar si es el caso
+echo 0 >/proc/sys/net/ipv4/conf/all/log_martians
+
+#Definir rango de puertos locales a ser usados por nuestras aplicaciones
+echo "32768 61000" >/proc/sys/net/ipv4/ip_local_port_range
+
+#Reducir posibilidad de DoS al reducir los timeouts
+#Tiempo en el que linux tratar� de finalizar una conexion
+echo 30 > /proc/sys/net/ipv4/tcp_fin_timeout
+#Tiempo para finalizar una conexi�n no activa
+echo 1800 > /proc/sys/net/ipv4/tcp_keepalive_time
+echo 1 > /proc/sys/net/ipv4/tcp_window_scaling
+echo 0 > /proc/sys/net/ipv4/tcp_sack
+#Maximo de conexiones SYN
+echo 1280 > /proc/sys/net/ipv4/tcp_max_syn_backlog
+
+##Activando reglas basicas
+
+#Eliminar todo paquete sin sentido, incluye:
+#-Paquetes muy peque�os para tener un encabezamiento completo ICMP/UDP/TCP
+#- Paquetes TCP y UDP con cero (invalidos) puertos de origen y destino
+#-Combinaciones ilegales de banderas TCP
+#-Opciones TCP e IP con cero (invalido) o sobredimensionada
+#	o opciones despues de la opcion END-OF-OPTIONS
+#-Fragmentos con longitud ilegal (ej., Ping of Death).
+#Tomado de: http://www.linux-mag.com/2000-01/bestdefense_02.html
+
+#Matar paquetes con combinaciones de banderas invalidas
+$IPTABLES -A INPUT -m state --state INVALID -j DROP
+$IPTABLES -A FORWARD -m state --state INVALID -j DROP
+
+# solo activar si se tiene el paquete de ipp2p (instalar de: 
+# http://homen.vsb.cz/~hrb33/el4/hrb/stable/i386/RPMS/repodata/
+# ipp2p y el kmod* adecuado para el kernel)
+#$IPTABLES -A FORWARD -m ipp2p --ipp2p -j DROP
+#$IPTABLES -t mangle -A FORWARD -m ipp2p --ipp2p -j DROP
+#$IPTABLES -t nat -A PREROUTING -p tcp -i $INTERNALIF -m ipp2p --ipp2p -j DROP
+#$IPTABLES -t nat -A POSTROUTING -p tcp -o $EXTERNALIF -m ipp2p --ipp2p -j DROP
+
+# Permitir todas las conexiones en la interfaz local
+#
+$IPTABLES -A INPUT -i lo -j ACCEPT
+
+#Eliminar conexiones a la interfaz local desde el mundo exterior
+$IPTABLES -A INPUT -d 127.0.0.0/8 -j REJECT
+
+#No permitir que maquinas de la red interna se conecten al smtp de otros
+#servirores en internet, deshabilitar si ud usa smtp remoto
+$IPTABLES -A FORWARD -s $INTERNALNET -p tcp --dport 25 -j DROP
+
+#No permitir que esta MAC pueda navegar
+#poner tantas lineas como mac se quieran bloquear
+#$IPTABLES -A FORWARD -i $INTERNALIF -m mac --mac-source 00:14:51:27:c5:64 -j DROP
+
+
+#Permitir trafico ilimitado de la red interna que usan direcciones validas
+$IPTABLES -A INPUT -i $INTERNALIF -s $INTERNALNET -j ACCEPT
+#
+#IPv6 tunneling
+#$IPTABLES -A INPUT -p ipv6 -j ACCEPT
+
+#Permitir trafico del dispositivo IPSEC a la red interna
+$IPTABLES -A FORWARD -i tun0 -o $INTERNALIF -j ACCEPT
+
+#Permitir negociacion de claves
+#$IPTABLES -A INPUT -p udp --dport 500 -j ACCEPT
+#$IPTABLES -A INPUT -p udp --dport 4500 -j ACCEPT
+
+#Protocolo 50 y 51, necesario para el correcto trabajo de ipsec
+#$IPTABLES -A INPUT -p esp -j ACCEPT
+#$IPTABLES -A INPUT -p ah -j ACCEPT
+
+#Kill anything from outside claiming to be from internal network
+$IPTABLES -A INPUT -i $EXTERNALIF -s $INTERNALNET -j REJECT
+
+##ICMP
+#No enviar pings yendo hacia dentro
+#$IPTABLES -A FORWARD -p icmp --icmp-type echo-request -o $INTERNALIF -j REJECT
+#Protecci�n contra ping flood
+$IPTABLES -A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/s -j ACCEPT
+#$IPTABLES -A INPUT -p icmp --icmp-type echo-request -j DROP
+#Denegar icmp a direcciones broadcast
+#$IPTABLES -A INPUT -p icmp -d $INTERNALBCAST -j DROP
+
+#Permitir el resto de los ICMP
+$IPTABLES -A INPUT -p icmp -j ACCEPT
+
+#No reenviar trafico SMB
+$IPTABLES -A FORWARD -o $EXTERNALIF -p tcp --dport 137 -j REJECT 
+$IPTABLES -A FORWARD -o $EXTERNALIF -p tcp --dport 138 -j REJECT 
+$IPTABLES -A FORWARD -o $EXTERNALIF -p tcp --dport 139 -j REJECT 
+$IPTABLES -A FORWARD -o $EXTERNALIF -p udp --dport 137 -j REJECT 
+$IPTABLES -A FORWARD -o $EXTERNALIF -p udp --dport 138 -j REJECT 
+$IPTABLES -A FORWARD -o $EXTERNALIF -p udp --dport 139 -j REJECT 
+$IPTABLES -A INPUT -i $EXTERNALIF -p udp --dport 137 -j REJECT
+#
+#Permitir el resto del trafico salir
+$IPTABLES -A FORWARD -o $EXTERNALIF -i $INTERNALIF -j ACCEPT
+
+#Permitir las respuestas entrar
+$IPTABLES -A OUTPUT -m state --state NEW -o $EXTERNALIF -j ACCEPT
+$IPTABLES -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+$IPTABLES -A FORWARD -m state --state NEW -o $EXTERNALIF -j ACCEPT
+$IPTABLES -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+#Permitir a esta maquina ser un servidor DHCP para su red interna
+#$IPTABLES -A INPUT -i $INTERNALIF -p tcp --sport 68 --dport 67 -j ACCEPT
+#$IPTABLES -A INPUT -i $INTERNALIF -p udp --sport 68 --dport 67 -j ACCEPT
+
+#Activar en caso de implementar openvpn, interfaces tun/tap
+#y puerto 1194 para openvpn
+$IPTABLES -A INPUT -i tun0 -j ACCEPT
+$IPTABLES -A FORWARD -i tun0 -j ACCEPT
+$IPTABLES -A FORWARD -o tun+ -j ACCEPT
+$IPTABLES -A OUTPUT -o tun+ -j ACCEPT
+$IPTABLES -A INPUT -i tap+ -j ACCEPT
+$IPTABLES -A FORWARD -i tap+ -j ACCEPT
+$IPTABLES -A INPUT -p udp --dport 1194 -j ACCEPT
+#descomentar para usar snort inline, indicar puerto a encolar
+#$IPTABLES -I INPUT -p tcp --dport 80 -j QUEUE
+
+#De aqui en adelante, trabajamos con intentos de conexion.
+#El -m limit es una protecciones contra DoS
+#Primero permitimos una cierta cantidad de conexiones/Segundo
+#DROP - Descartamos al resto, de tal forma que no nos neguemos nosotros mismos
+#el servicio
+##Servicios basicos. Descomentar para permitirlos
+#Estos son puertos que estamos abriendo al exterior!!
+#Si los vamos a usar en la red interna, no es necesario abrirlos aqui
+#Solo para abrirlos a la red externa, a la internet
+# ftp-data
+#$IPTABLES -A INPUT -p tcp  --dport 20 -j ACCEPT
+# ftp
+#$IPTABLES -A INPUT -p tcp  --dport 21 -j ACCEPT
+# ssh 
+$IPTABLES -A INPUT -p tcp --dport 22 -j ACCEPT
+#telnet
+#$IPTABLES -A INPUT -p tcp --dport 23 -j ACCEPT
+# smtp  Una conexion por segundo
+#$IPTABLES -A INPUT -p tcp --dport 25 --syn -m limit --limit 2/s \
+#        --limit-burst 10 -j ACCEPT 
+#$IPTABLES -A INPUT -p tcp --dport 25 --syn -j DROP 
+#$IPTABLES -A INPUT -p tcp --dport 25 -j ACCEPT
+
+#nessus
+#$IPTABLES -A INPUT -p tcp --dport 1241 -j ACCEPT
+
+# DNS   
+#$IPTABLES -A INPUT -p tcp --dport 53 -j ACCEPT
+#$IPTABLES -A INPUT -p udp --dport 53 -j ACCEPT
+# http 
+$IPTABLES -A INPUT -p tcp --dport 80 -j ACCEPT
+# POP-3
+#$IPTABLES -A INPUT -p tcp --dport 110 -j ACCEPT
+#imap
+#$IPTABLES -A INPUT -p tcp --dport 143 -j ACCEPT
+# identd
+#$IPTABLES -A INPUT -p tcp --dport 113 -j ACCEPT
+# https
+#$IPTABLES -A INPUT -p tcp --dport 443 -j ACCEPT
+#VNC Server
+#$IPTABLES -A INPUT -p tcp --dport 5801 -j ACCEPT
+#$IPTABLES -A INPUT -p tcp --dport 5901 -j ACCEPT
+#$IPTABLES -A INPUT -p tcp --dport 6001 -j ACCEPT
+#Webmin
+#$IPTABLES -A INPUT -p tcp --dport 10000 -j ACCEPT
+
+#
+##DNAT
+#Modificar las direcciones y descomentar para hacer forwarding (DNAT)
+MYADDR="1.2.3.4"        # IP Externa
+
+#Enviar peticiones web a una maquina interna (192.168.0.10 ?)
+#$IPTABLES -A PREROUTING -t nat -i $EXTERNALIF -p tcp -d $MYADDR --dport 80 \
+#                      -j DNAT --to 192.168.0.10:80
+#$IPTABLES -A FORWARD -i $EXTERNALIF -p tcp -d 192.168.0.10 --dport 80 -j ACCEPT
+
+#Smtp a un servidor interno
+#$IPTABLES -A PREROUTING -t nat -i $EXTERNALIF -p tcp -d $MYADDR --dport 25 \
+#                      -j DNAT --to 192.168.0.10:25
+#$IPTABLES -A FORWARD -i $EXTERNALIF -p tcp -d 192.168.0.10 --dport 25 -j ACCEPT
+
+
+##Puertos que deben ser denegados y guardados
+$IPTABLES -A INPUT -p tcp --dport 1433 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: MSSQL " 
+
+$IPTABLES -A INPUT -p tcp --dport 1433 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 6670 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: Deepthrt " 
+$IPTABLES -A INPUT -p tcp --dport 6670 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 6711 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: Sub7 " 
+$IPTABLES -A INPUT -p tcp --dport 6711 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 6712 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: Sub7 " 
+$IPTABLES -A INPUT -p tcp --dport 6712 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 6713 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: Sub7 " 
+$IPTABLES -A INPUT -p tcp --dport 6713 -j DROP
+
+$IPTABLES -A INPUT -p tcp --dport 12345 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: Netbus " 
+$IPTABLES -A INPUT -p tcp --dport 12345 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 12346 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: Netbus " 
+$IPTABLES -A INPUT -p tcp --dport 12346 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 20034 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: Netbus " 
+$IPTABLES -A INPUT -p tcp --dport 20034 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 31337 -m limit -j LOG \
+                          --log-prefix "Firewalled packet: BO " 
+$IPTABLES -A INPUT -p tcp --dport 31337 -j DROP
+$IPTABLES -A INPUT -p tcp --dport 6000  -m limit -j LOG \
+                          --log-prefix "Firewalled packet: XWin "
+$IPTABLES -A INPUT -p tcp --dport 6000  -j DROP
+
+$IPTABLES -A INPUT -p udp --dport 33434:33523 -j DROP
+
+#No guardar ident porque es muy usado por servidores irc
+$IPTABLES -A INPUT -p tcp --dport 113 -j REJECT
+
+#No guardar IGMP, muchas personas reciben enorme cantidad de este
+$IPTABLES -A INPUT -p igmp -j REJECT
+
+#No guardar http ni https pues navegar por largos periodos causan muchas
+#conexiones caidas y llenan nuestros logs.
+$IPTABLES -A INPUT -p tcp --dport 80 -j REJECT
+$IPTABLES -A INPUT -p tcp --dport 443 -j REJECT
+
+##Reglas de captura generales
+#iptables viene a estas si no han matcheado en ninguna de las previas
+#No tiene sentido guardarlas, no es m�s que ruido
+$IPTABLES -A INPUT -p tcp --syn -m limit --limit 5/minute -j LOG  \
+	--log-prefix "Firewalled packet:"
+$IPTABLES -A FORWARD -p tcp --syn -m limit --limit 5/minute -j LOG \
+	--log-prefix "Firewalled packet:"
+
+#Reject
+$IPTABLES -A INPUT -p tcp -j REJECT --reject-with tcp-reset
+$IPTABLES -A INPUT -p all -j DROP
+
+$IPTABLES -A FORWARD -p tcp -j REJECT --reject-with tcp-reset
+$IPTABLES -A FORWARD -p all -j DROP  
+#Accept it anyway if it's only output
+$IPTABLES -A OUTPUT -j ACCEPT
+
+#redireccionamiento del puerto 80 al 3128
+$IPTABLES -t nat -A PREROUTING -i $INTERNALIF -p tcp --dport 80 -j REDIRECT --to-port 3128
+
+#Logueamos y descartamos paquetes de la red local intentando salir
+$IPTABLES -A FORWARD -p tcp --dport 25 -j LOG
+$IPTABLES -A FORWARD -p tcp --dport 25 -j DROP
+$IPTABLES -A OUTPUT -p tcp --dport 25 -j DROP
+
+#Enmascarar conexiones internar yendo hacia fuera.
+#Comentar si no se desea proxy transparente
+#Recordar que si se permiten conexiones desde el interior, los clientes
+#no usarian el proxy haciendonos perder ancho de banda por no cache
+$IPTABLES -A POSTROUTING -t nat -o $EXTERNALIF -j MASQUERADE
+
+exit 0
